@@ -1,0 +1,12 @@
+SOURCE SNAPSHOT — 2026-09-29
+
+This archive contains the current C++ source and build script, without binaries.
+Build with Visual Studio 2022 C++ Build Tools by running build.bat.
+
+Known issues:
+- The current native_visibility.h includes the experimental debugger-cleanup change. Its live shutdown test left the game frozen. This snapshot is not a working release.
+- The network wall-check experiment was reverted. Wall checks in joined network games remain unresolved.
+- Silent aim damage in joined network games remains unresolved.
+- Prior standalone/single-player testing does not establish network compatibility.
+
+The included README describes features and earlier validation; the known issues above supersede its release-status claims.

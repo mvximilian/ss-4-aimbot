@@ -6,13 +6,17 @@ ShotRotation shotRotation(Ang a){
 }
 struct VisibilityRow {uint64_t entity=0,player=0,world=0;uint32_t tick=0,visible=0;Vec eye{},position{},aim{};};
 inline float distanceSquared(Vec a,Vec b){return (a.x-b.x)*(a.x-b.x)+(a.y-b.y)*(a.y-b.y)+(a.z-b.z)*(a.z-b.z);}
-bool freshVisibility(const VisibilityRow& r,DWORD now,Vec eye,Vec position){return r.visible==1&&DWORD(now-r.tick)<=150&&finite(r.aim)&&finite(r.eye)&&finite(r.position)&&distanceSquared(eye,r.eye)<=0.0025f&&distanceSquared(position,r.position)<=0.0025f;}
+bool freshVisibility(const VisibilityRow& r,DWORD now,Vec eye,Vec position){return r.visible==1&&DWORD(now-r.tick)<=150&&finite(r.aim)&&finite(r.eye)&&finite(r.position)&&distanceSquared(eye,r.eye)<=0.25f&&distanceSquared(position,r.position)<=0.25f;}
 // Native Windows hardware-breakpoint tracer. No CE, DLL or game-code patch.
 struct Visibility {
-    struct Thread {HANDLE handle;int slot;DWORD64 savedDr,savedBits;int shotSlot=-1;DWORD64 savedShotDr=0,savedShotBits=0;};
+    struct Thread {HANDLE handle;int slot;DWORD64 savedDr,savedBits;int shotSlot=-1;DWORD64 savedShotDr=0,savedShotBits=0;int bodySlot=-1;DWORD64 savedBodyDr=0,savedBodyBits=0;};
     std::thread worker;std::atomic<bool> stopRequested{false},attached{false};
     std::atomic<unsigned> clearCount{0},blockedCount{0},hitCount{0};
     std::atomic<unsigned> shotHits{0},playerShotHits{0};
+    std::atomic<float> lastEyeError{0},lastTargetError{0};std::atomic<unsigned> lastRawVisible{0};
+    std::atomic<unsigned> visibilityMissing{0},visibilityBlocked{0},visibilityExpired{0},visibilityMoved{0},visibilityAllowed{0};
+    std::atomic<unsigned> modeDisabled{0},inputMissing{0},background{0};
+    std::atomic<unsigned> noTarget{0},staleShot{0},wallReject{0},poseReject{0},writeReject{0},unmatchedRays{0};
     std::atomic<unsigned> redirected{0};bool writesEnabled=false;
     struct ShotRequest {U player=0,entity=0,world=0;Vec eye{},upper{},point{};DWORD tick=0;bool wall=true;};
     ShotRequest shot;
@@ -20,23 +24,31 @@ struct Visibility {
     void clearSilent(){std::lock_guard<std::mutex> lock(mutex);shot={};}
     void captureShot(const CONTEXT& c){
         ++shotHits;if(value<U>(c.Rdi)!=base+0x18374B0)return;++playerShotHits;
-        if(!writesEnabled||!ui.aim||!ui.silent||!(GetAsyncKeyState(VK_RBUTTON)&0x8000)||!(GetAsyncKeyState(VK_LBUTTON)&0x8000))return;
-        DWORD active=0;GetWindowThreadProcessId(GetForegroundWindow(),&active);if(active!=pid)return;
+        if(!writesEnabled||!ui.aim||!ui.silent){++modeDisabled;return;}
+        if(!(GetAsyncKeyState(VK_RBUTTON)&0x8000)||!(GetAsyncKeyState(VK_LBUTTON)&0x8000)){++inputMissing;return;}
+        DWORD active=0;GetWindowThreadProcessId(GetForegroundWindow(),&active);if(active!=pid){++background;return;}
         ShotRequest s;bool clearRay=false;
         {std::lock_guard<std::mutex> lock(mutex);s=shot;if(s.wall)for(const auto& r:cache)if(r.entity==s.entity&&r.player==s.player&&r.world==s.world&&freshVisibility(r,GetTickCount(),s.eye,s.upper)){clearRay=true;break;}}
-        if(!s.entity||s.player!=c.Rdi||DWORD(GetTickCount()-s.tick)>50||!finite(s.point)||(s.wall&&!clearRay))return;
+        if(!s.entity){++noTarget;return;}
+        if(s.player!=c.Rdi||DWORD(GetTickCount()-s.tick)>50||!finite(s.point)){++staleShot;return;}
+        if(s.wall&&!clearRay){++wallReject;return;}
         Vec eye{},upper{};struct Placement {ShotRotation rotation;Vec origin;};Placement original{};
-        if(value<U>(s.player+0x30)!=s.world||value<U>(s.entity+0x30)!=s.world||value<int>(s.entity+0x574)<=0||!position(s.player,eye)||!position(s.entity,upper))return;
-        if(distanceSquared(eye,s.eye)>0.0025f||distanceSquared(upper,s.upper)>0.0025f||!read(c.Rsi,original)||!finite(original.origin))return;
+        if(value<U>(s.player+0x30)!=s.world||value<U>(s.entity+0x30)!=s.world||value<int>(s.entity+0x574)<=0||!position(s.player,eye)||!position(s.entity,upper)){++poseReject;return;}
+        if(distanceSquared(eye,s.eye)>0.0025f||distanceSquared(upper,s.upper)>0.0025f||!read(c.Rsi,original)||!finite(original.origin)){++poseReject;return;}
         float norm=original.rotation.x*original.rotation.x+original.rotation.y*original.rotation.y+original.rotation.z*original.rotation.z+original.rotation.w*original.rotation.w;
-        if(!std::isfinite(norm)||std::abs(norm-1.f)>0.02f||distanceSquared(original.origin,eye)>9.f)return;
+        if(!std::isfinite(norm)||std::abs(norm-1.f)>0.02f||distanceSquared(original.origin,eye)>9.f){++poseReject;return;}
         ShotRotation rotation=shotRotation(angles(original.origin,s.point));
-        SIZE_T n=0;if(WriteProcessMemory(process,(void*)c.Rsi,&rotation,sizeof(rotation),&n)&&n==sizeof(rotation))++redirected;
+        SIZE_T n=0;if(WriteProcessMemory(process,(void*)c.Rsi,&rotation,sizeof(rotation),&n)&&n==sizeof(rotation)){++redirected;updateModelFacing(s);}else ++writeReject;
     }
     std::mutex mutex,shutdownMutex;std::vector<VisibilityRow> cache,rows;std::string message="Tracer not started";
     DWORD pid=0;U base=0,address=0;HANDLE process=nullptr;std::map<DWORD,Thread> threads;
     ~Visibility(){stop();}
     std::string status(){std::lock_guard<std::mutex> lock(mutex);return message;}
+    std::string diagnostics(){
+        return "Body build hits "+std::to_string(bodyBuildHits.load())+" overrides "+std::to_string(bodyBuildOverrides.load())+"\r\nBody observations "+std::to_string(modelObserved.load())+" aligned "+std::to_string(modelAligned.load())+" separate from camera "+std::to_string(modelSeparate.load())+"\r\nBody direction requests "+std::to_string(modelWrites.load())+" failures "+std::to_string(modelFailures.load())+"\r\nFresh rays: clear "+std::to_string(activeClear.load())+" blocked "+std::to_string(activeBlocked.load())+" errors "+std::to_string(activeErrors.load())+" camera writes "+std::to_string(cameraWrites.load())+"\r\nAim "+std::to_string(ui.aim.load())+" silent "+std::to_string(ui.silent.load())+" | Gates: disabled "+std::to_string(modeDisabled.load())+" input "+std::to_string(inputMissing.load())+" background "+std::to_string(background.load())+"\r\nRays "+std::to_string(hitCount.load())+" clear "+std::to_string(clearCount.load())+" blocked "+std::to_string(blockedCount.load())+" unmatched "+std::to_string(unmatchedRays.load())+
+        " | Weapon "+std::to_string(playerShotHits.load())+" writes "+std::to_string(redirected.load())+
+        "\r\nSilent rejects: target "+std::to_string(noTarget.load())+" stale "+std::to_string(staleShot.load())+" wall "+std::to_string(wallReject.load())+" pose "+std::to_string(poseReject.load())+" write "+std::to_string(writeReject.load())+"\r\nVisibility: allowed "+std::to_string(visibilityAllowed.load())+" missing "+std::to_string(visibilityMissing.load())+" blocked "+std::to_string(visibilityBlocked.load())+" expired "+std::to_string(visibilityExpired.load())+" moved "+std::to_string(visibilityMoved.load())+"\r\nLast ray: raw "+std::to_string(lastRawVisible.load())+" eye gap "+std::to_string(lastEyeError.load())+" target gap "+std::to_string(lastTargetError.load());
+    }
     void status(std::string s){std::lock_guard<std::mutex> lock(mutex);message=std::move(s);}
     void clear(){std::lock_guard<std::mutex> lock(mutex);cache.clear();}
     template<class T> bool read(U a,T& v){SIZE_T n=0;return a>0x10000&&ReadProcessMemory(process,(void*)a,&v,sizeof(v),&n)&&n==sizeof(v);}
@@ -55,12 +67,16 @@ struct Visibility {
         else if(value<U>(target)==base+0x18374B0){r.player=target;r.entity=viewer;endpoint=to;r.aim=from;}else return;
         r.world=value<U>(r.player+0x30);
         if(!r.world||value<U>(r.entity+0x30)!=r.world||!position(r.player,r.eye)||!position(r.entity,r.position))return;
-        r.tick=GetTickCount();r.visible=visible==1&&distanceSquared(endpoint,r.eye)<=0.0025f&&distanceSquared(r.position,r.aim)<=4.f;
-        if(r.visible)++clearCount;else ++blockedCount;
+        lastEyeError=std::sqrt(distanceSquared(endpoint,r.eye));lastTargetError=std::sqrt(distanceSquared(r.position,r.aim));lastRawVisible=visible;
+        r.tick=GetTickCount();bool endpointsMatch=distanceSquared(endpoint,r.eye)<=0.0025f&&distanceSquared(r.position,r.aim)<=4.f;
+        r.visible=visible==1&&endpointsMatch;
+        if(!endpointsMatch)++unmatchedRays;else if(r.visible)++clearCount;else ++blockedCount;
         std::lock_guard<std::mutex> lock(mutex);
         cache.erase(std::remove_if(cache.begin(),cache.end(),[&](const auto& v){return v.entity==r.entity||DWORD(r.tick-v.tick)>150;}),cache.end());
         if(cache.size()<256)cache.push_back(r);
     }
+    #include "model_facing.h"
+    #include "active_ray.h"
     static DWORD64& dr(CONTEXT& c,int i){switch(i){case 0:return c.Dr0;case 1:return c.Dr1;case 2:return c.Dr2;default:return c.Dr3;}}
     bool arm(DWORD id,HANDLE h){
         CONTEXT c{};c.ContextFlags=CONTEXT_DEBUG_REGISTERS;if(!GetThreadContext(h,&c))return false;
@@ -72,32 +88,58 @@ struct Visibility {
                 dr(c,j)=base+0x2D5FB7;c.Dr7=(c.Dr7&~m)|(1ull<<(j*2));break;
             }
             if(t.shotSlot<0)return false;
+            for(int k=0;k<4;k++)if(!(c.Dr7&(3ull<<(k*2)))){
+                DWORD64 maskBody=(3ull<<(k*2))|(15ull<<(16+k*4));t.bodySlot=k;t.savedBodyDr=dr(c,k);t.savedBodyBits=c.Dr7&maskBody;
+                dr(c,k)=base+0x278E7B;c.Dr7=(c.Dr7&~maskBody)|(1ull<<(k*2));break;
+            }
+            if(t.bodySlot<0)return false;
             if(!SetThreadContext(h,&c))return false;threads[id]=t;return true;
         }return false;
     }
+    std::vector<HANDLE> suspendedForDetach;
     void restore(){
+        // Stop every tracked thread before removing any breakpoint, and keep
+        // them stopped until the debugger has detached.
         for(auto& [id,t]:threads){
-            (void)id;if(SuspendThread(t.handle)!=DWORD(-1)){
-                CONTEXT c{};c.ContextFlags=CONTEXT_DEBUG_REGISTERS;
-                if(GetThreadContext(t.handle,&c)&&dr(c,t.slot)==address){
-                    DWORD64 mask=(3ull<<(t.slot*2))|(15ull<<(16+t.slot*4));
-                    dr(c,t.slot)=t.savedDr;c.Dr7=(c.Dr7&~mask)|t.savedBits;c.Dr6&=~(1ull<<t.slot);
-                    if(t.shotSlot>=0&&dr(c,t.shotSlot)==base+0x2D5FB7){DWORD64 m=(3ull<<(t.shotSlot*2))|(15ull<<(16+t.shotSlot*4));dr(c,t.shotSlot)=t.savedShotDr;c.Dr7=(c.Dr7&~m)|t.savedShotBits;c.Dr6&=~(1ull<<t.shotSlot);}
-                    SetThreadContext(t.handle,&c);
-                }ResumeThread(t.handle);
-            }CloseHandle(t.handle);
-        }threads.clear();
+            (void)id;
+            if(SuspendThread(t.handle)!=DWORD(-1))suspendedForDetach.push_back(t.handle);
+        }
+        for(auto& [id,t]:threads){
+            (void)id;CONTEXT c{};c.ContextFlags=CONTEXT_DEBUG_REGISTERS;
+            if(!GetThreadContext(t.handle,&c))continue;
+            auto remove=[&](int slot,U expected,DWORD64 saved,DWORD64 bits){
+                if(slot<0||dr(c,slot)!=expected)return;
+                DWORD64 mask=(3ull<<(slot*2))|(15ull<<(16+slot*4));
+                dr(c,slot)=saved;c.Dr7=(c.Dr7&~mask)|bits;c.Dr6&=~(1ull<<slot);
+            };
+            remove(t.slot,address,t.savedDr,t.savedBits);
+            remove(t.shotSlot,base+0x2D5FB7,t.savedShotDr,t.savedShotBits);
+            remove(t.bodySlot,base+0x278E7B,t.savedBodyDr,t.savedBodyBits);
+            if(!SetThreadContext(t.handle,&c))status("Breakpoint cleanup failed");
+        }
+    }
+    void releaseThreads(){
+        for(HANDLE h:suspendedForDetach)ResumeThread(h);
+        suspendedForDetach.clear();
+        for(auto& [id,t]:threads){(void)id;CloseHandle(t.handle);}
+        threads.clear();
     }
     void run(){
-        process=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ|(writesEnabled?PROCESS_VM_WRITE|PROCESS_VM_OPERATION:0),FALSE,pid);
+        process=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ|PROCESS_VM_WRITE|PROCESS_VM_OPERATION,FALSE,pid);
         if(!process){status("Cannot read game for wall tracer");return;}
         unsigned char bytes[10]{};const unsigned char expected[]={0x0f,0x28,0x74,0x24,0x50,0x4c,0x8d,0x5c,0x24,0x60};
         if(!read(address,bytes)||std::memcmp(bytes,expected,sizeof(bytes))){status("Unsupported raycast signature");CloseHandle(process);process=nullptr;return;}
         unsigned char shotBytes[8]{};const unsigned char shotExpected[]={0x4c,0x8d,0x9c,0x24,0x90,1,0,0};
         if(!read(base+0x2D5FB7,shotBytes)||std::memcmp(shotBytes,shotExpected,8)){status("Unsupported weapon rotation signature");CloseHandle(process);process=nullptr;return;}
-        if(!DebugActiveProcess(pid)){status("Wall tracer attach failed ("+std::to_string(GetLastError())+"); close other debuggers");CloseHandle(process);process=nullptr;return;}
-        DebugSetProcessKillOnExit(FALSE);attached=true;status("Native wall tracer active");bool initial=true,exited=false,failed=false;
-        while(!stopRequested){
+        unsigned char bodyBytes[7]{};const unsigned char bodyExpected[]={0x48,0x8b,0x86,0xd0,1,0,0};
+        if(!read(base+0x278E7B,bodyBytes)||std::memcmp(bodyBytes,bodyExpected,7)){status("Unsupported body rotation signature");CloseHandle(process);process=nullptr;return;}
+        if(!initActive()){freeActive();status("Active ray setup failed");CloseHandle(process);process=nullptr;return;}
+        if(!DebugActiveProcess(pid)){status("Wall tracer attach failed ("+std::to_string(GetLastError())+"); close other debuggers");freeActive();CloseHandle(process);process=nullptr;return;}
+        DebugSetProcessKillOnExit(FALSE);attached=true;status("Active wall checks ready");bool initial=true,exited=false,failed=false;
+        auto report=std::chrono::steady_clock::now();
+        while(!stopRequested||rayPending){
+            serviceModelFacing();
+            if(std::chrono::steady_clock::now()>=report){std::ofstream log("aim-diagnostics.txt",std::ios::trunc);log<<"PID "<<pid<<"\n"<<status()<<"\n"<<diagnostics()<<"\n";report=std::chrono::steady_clock::now()+std::chrono::seconds(1);}
             DEBUG_EVENT e{};if(!WaitForDebugEvent(&e,50)){if(GetLastError()==ERROR_SEM_TIMEOUT)continue;status("Wall tracer event error");break;}
             DWORD continuation=DBG_CONTINUE;
             switch(e.dwDebugEventCode){
@@ -111,29 +153,37 @@ struct Visibility {
             case LOAD_DLL_DEBUG_EVENT:if(e.u.LoadDll.hFile)CloseHandle(e.u.LoadDll.hFile);break;
             case EXCEPTION_DEBUG_EVENT:{
                 continuation=DBG_EXCEPTION_NOT_HANDLED;DWORD code=e.u.Exception.ExceptionRecord.ExceptionCode;
-                if(code==EXCEPTION_BREAKPOINT&&initial){initial=false;continuation=DBG_CONTINUE;}
+                if(code==EXCEPTION_BREAKPOINT&&activeTrap(e)){continuation=DBG_CONTINUE;}
+                else if(code==EXCEPTION_BREAKPOINT&&initial){initial=false;continuation=DBG_CONTINUE;}
                 else if(code==EXCEPTION_SINGLE_STEP){auto it=threads.find(e.dwThreadId);if(it!=threads.end()){
                     CONTEXT c{};c.ContextFlags=CONTEXT_FULL|CONTEXT_DEBUG_REGISTERS;
-                    if(GetThreadContext(it->second.handle,&c)&&((c.Rip==address&&(c.Dr6&(1ull<<it->second.slot)))||(c.Rip==base+0x2D5FB7&&(c.Dr6&(1ull<<it->second.shotSlot))))){
+                    if(GetThreadContext(it->second.handle,&c)&&((c.Rip==address&&(c.Dr6&(1ull<<it->second.slot)))||(c.Rip==base+0x2D5FB7&&(c.Dr6&(1ull<<it->second.shotSlot)))||(c.Rip==base+0x278E7B&&(c.Dr6&(1ull<<it->second.bodySlot))))){
                         int slot=it->second.slot;
-                        if(c.Rip==address)capture(c.Rbx);else{slot=it->second.shotSlot;captureShot(c);}
+                        if(c.Rip==address){if(c.Rbx!=rayData)capture(c.Rbx);}else if(c.Rip==base+0x278E7B){slot=it->second.bodySlot;captureBodyBuild(c);}else{slot=it->second.shotSlot;if(!beginRay(c,e.dwThreadId)&&!ui.wall)captureShot(c);}
                         c.Dr6&=~(1ull<<slot);c.EFlags|=0x10000;
                         if(SetThreadContext(it->second.handle,&c))continuation=DBG_CONTINUE;else failed=true;
                     }
                 }}break;
             }
-            case EXIT_PROCESS_DEBUG_EVENT:exited=true;break;
+            case EXIT_PROCESS_DEBUG_EVENT:exited=true;rayPending=false;break;
             }
             ContinueDebugEvent(e.dwProcessId,e.dwThreadId,continuation);if(exited||failed)break;
         }
-        restore();if(!exited)DebugActiveProcessStop(pid);attached=false;clear();
+        restoreModelFacing();restore();freeActive();if(!exited)DebugActiveProcessStop(pid);releaseThreads();attached=false;clear();
         if(failed)status("Could not arm game threads; wall tracer stopped");else if(exited)status("Game exited");
         CloseHandle(process);process=nullptr;
     }
     void start(DWORD p,U b,bool writes=false){stop();pid=p;base=b;writesEnabled=writes;address=b+0x1A47C4;stopRequested=false;worker=std::thread([this]{run();});}
     void stop(){std::lock_guard<std::mutex> lock(shutdownMutex);stopRequested=true;if(worker.joinable())worker.join();clear();}
     void refresh(DWORD p){std::lock_guard<std::mutex> lock(mutex);rows=(p==pid&&attached)?cache:std::vector<VisibilityRow>{};}
-    bool allowed(U entity,U player,U world,Vec eye,Vec position,Vec& aim)const{
-        for(const auto& r:rows)if(r.entity==entity&&r.player==player&&r.world==world&&freshVisibility(r,GetTickCount(),eye,position)){aim=r.aim;return true;}return false;
+    bool allowed(U entity,U player,U world,Vec eye,Vec position,Vec& aim){
+        std::lock_guard<std::mutex> lock(mutex);
+        if(attached)for(const auto& r:cache)if(r.entity==entity&&r.player==player&&r.world==world){
+            if(!r.visible){++visibilityBlocked;return false;}
+            if(DWORD(GetTickCount()-r.tick)>150){++visibilityExpired;return false;}
+            if(!freshVisibility(r,GetTickCount(),eye,position)){++visibilityMoved;return false;}
+            aim=r.aim;++visibilityAllowed;return true;
+        }
+        ++visibilityMissing;return false;
     }
 } visibility;

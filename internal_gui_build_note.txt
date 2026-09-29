@@ -1,0 +1,1 @@
+The internal UI is implemented as an in-process DLL which creates its own transparent D3D11 ImGui overlay window. It does not hook the game's renderer, so the game can remain on DX11, DX12 or Vulkan. The DLL is loaded into Sam4.exe by the controller and reads/writes a shared settings block.
